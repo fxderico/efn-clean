@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create
+        required: true
+        default: v1.2.0-clean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: ./gradlew --no-daemon build
+
+      - name: Install Xvfb + Mesa (software OpenGL)
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dri mesa-utils
+
+      # Launches the real production jar in a Minecraft client, then force-applies every mixin
+      # (Mixin audit) and quits. Any mixin failure or crash fails the job, so a broken jar never gets released.
+      - name: Smoke test (production client, in-game)
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: ./gradlew --no-daemon prodClientSmokeTest
+
+      - name: Upload smoke-test screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoketest
+          path: |
+            build/smoketest-run/screenshots/
+            build/smoketest-run/logs/
+          if-no-files-found: ignore
+
+      - name: Checksums
+        run: |
+          cd build/libs
+          rm -f *-gametest*.jar *-dev.jar
+          sha256sum *.jar > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || 'v1.2.0-clean' }}
+          target_commitish: ${{ github.sha }}
+          name: EFN Client ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || 'v1.2.0-clean' }}
+          files: |
+            build/libs/efn-client-*.jar
+            build/libs/SHA256SUMS.txt
+          body: |
+            EFN Client 1.2.0 for Minecraft 1.21.11 (Fabric), **with the stealer dropper removed**,
+            built from this repository's source by GitHub Actions.
+
+            Removed from the original `efn-client-1.2.0.jar`: `net.efn.agent.AgentInit` (dropper),
+            `assets/efn/data/runtime.dat` (encrypted stage-2 stealer), the `main` entrypoint that
+            launched it, and the hijacked `Main-Class`. See README for verification details.
+
+            This build passed an in-game smoke test in CI: the production jar boots a real client to
+            the title screen, a Mixin audit applies all of EFN's 267 injections without error, and
+            every EFN class's static initializer runs without error.
+            Screenshots are in the workflow run's `smoketest` artifact.
+
+            Requires Fabric Loader >= 0.16 and Fabric API. Checksums in `SHA256SUMS.txt`.

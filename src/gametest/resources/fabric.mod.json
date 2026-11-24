@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "efn-smoketest",
+  "version": "1.0.0",
+  "name": "EFN smoke test",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-client-gametest": ["net.efn.smoketest.EfnSmokeTest"]
+  },
+  "depends": {
+    "efn": "*",
+    "fabric-api": "*"
+  }
+}

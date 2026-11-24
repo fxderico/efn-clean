@@ -1,0 +1,51 @@
+package com.example.client.mixin;
+
+import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
+
+import net.efn.client.module.impl.render.SwingAnimationModule;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.Hand;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Environment(EnvType.CLIENT)
+@Mixin({LivingEntity.class})
+public abstract class MixinSwingAnimationLivingEntity {
+
+    public MixinSwingAnimationLivingEntity() {}
+
+    @ModifyExpressionValue(
+            method = {"tickHandSwing()V", "swingHand(Lnet/minecraft/util/Hand;Z)V"},
+            at = {
+                @At(
+                        value = "INVOKE",
+                        target = "Lnet/minecraft/entity/LivingEntity;getHandSwingDuration()I")
+            })
+    private int efn$swingTempo(int i) {
+        SwingAnimationModule active = SwingAnimationModule.active;
+        return active != null && (Object) this == MinecraftClient.getInstance().player
+                ? active.swingTicks(i)
+                : i;
+    }
+
+    @Inject(
+            method = {"swingHand(Lnet/minecraft/util/Hand;Z)V"},
+            at = {
+                @At(
+                        value = "FIELD",
+                        target = "Lnet/minecraft/entity/LivingEntity;handSwinging:Z",
+                        opcode = 181)
+            })
+    private void efn$latchSwing(Hand hand, boolean bl, CallbackInfo ci) {
+        SwingAnimationModule active = SwingAnimationModule.active;
+        if (active != null && (Object) this == MinecraftClient.getInstance().player) {
+            active.latch();
+        }
+    }
+}

@@ -1,0 +1,176 @@
+buildscript {
+    repositories { mavenCentral() }
+    dependencies { classpath 'org.ow2.asm:asm-tree:9.7.1' }
+}
+
+plugins {
+    id 'fabric-loom' version '1.17.21'
+}
+
+version = project.mod_version
+group = 'net.efn'
+
+base {
+    archivesName = 'efn-client'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.fabricmc.net/' }
+    exclusiveContent {
+        forRepository { maven { url = 'https://api.modrinth.com/maven' } }
+        filter { includeGroup 'maven.modrinth' }
+    }
+}
+
+sourceSets {
+    // Production smoke test (see src/gametest/.../EfnSmokeTest.java). Not shipped in the release jar.
+    gametest {
+        compileClasspath += sourceSets.main.compileClasspath + sourceSets.main.output
+        runtimeClasspath += sourceSets.main.runtimeClasspath + sourceSets.main.output
+    }
+}
+
+configurations {
+    productionRuntimeMods
+    smoketestNatives
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+    productionRuntimeMods "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+    // EFN ships Windows ImGui natives only (same as the original); the Linux CI smoke test needs these.
+    smoketestNatives 'io.github.spair:imgui-java-natives-linux:1.90.0'
+
+    // Jar-in-jar: exactly the modules/libraries the original 1.2.0 jar bundled.
+    // Verified byte-identical to these Maven artifacts (Loom only adds a generated fabric.mod.json).
+    include 'net.fabricmc.fabric-api:fabric-api-base:1.0.5+4ebb5c083e'
+    include 'net.fabricmc.fabric-api:fabric-key-binding-api-v1:1.1.7+4fc5413f3e'
+    include 'net.fabricmc.fabric-api:fabric-lifecycle-events-v1:2.6.15+4ebb5c083e'
+    include 'net.fabricmc.fabric-api:fabric-rendering-fluids-v1:3.1.43+4ebb5c083e'
+    include 'net.fabricmc.fabric-api:fabric-resource-loader-v0:3.3.4+4fc5413f3e'
+    include 'net.fabricmc.fabric-api:fabric-resource-loader-v1:1.0.10+78c8b4663e'
+    include 'net.fabricmc.fabric-api:fabric-screen-api-v1:3.1.7+4ebb5c083e'
+
+    include(implementation('io.github.spair:imgui-java-binding:1.90.0'))
+    include(implementation('io.github.spair:imgui-java-lwjgl3:1.90.0') { transitive = false })
+    include(runtimeOnly('io.github.spair:imgui-java-natives-windows:1.90.0'))
+    include(implementation('io.netty:netty-codec-socks:4.2.7.Final') { transitive = false })
+    include(implementation('io.netty:netty-handler-proxy:4.2.7.Final') { transitive = false })
+
+    // Optional integrations ("suggests" in fabric.mod.json), used by net.efn.client.easyplace
+    modCompileOnly 'maven.modrinth:litematica:mengBR9D'   // litematica-fabric-1.21.11-0.26.16
+    modCompileOnly 'maven.modrinth:malilib:loabWpyU'      // malilib-fabric-1.21.11-0.27.20
+}
+
+loom {
+    mixin {
+        // Generate a refmap (named selector -> exact intermediary target). Without it, Loom remaps
+        // selector strings by name only, which picks the wrong overload when two Yarn methods share
+        // a name (e.g. MinecraftClient.disconnect).
+        useLegacyMixinAp = true
+        defaultRefmapName = 'efn.refmap.json'
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+    options.compilerArgs += ['-Xmaxerrs', '100000']
+}
+
+jar {
+    manifest {
+        // The original build's double-click notice ("put this file in your mods folder").
+        // The trojanized jar had repointed Main-Class at the dropper.
+        attributes 'Main-Class': 'net.efn.launcher.InstallNotice'
+    }
+}
+
+// Prints the compile classpath (used for quick javac iterations outside Gradle).
+tasks.register('printCompileClasspath') {
+    def cp = sourceSets.main.compileClasspath
+    doLast { println "CP=" + cp.asPath }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Yarn names two different intermediary methods `getShadowRadius` (EntityRenderer vs
+// LivingEntityRenderer), so javac emits an *inherited* bridge into mixins that extend
+// LivingEntityRenderer. Mixin would merge that bridge into PlayerEntityRenderer, changing which
+// getShadowRadius runs. The original jar has no such bridge; strip bridges in mixin classes that
+// only forward to a superclass (invokespecial), restoring the original class shape.
+// ---------------------------------------------------------------------------------------------
+tasks.named('compileJava') {
+    doLast {
+        def mixinDirs = ['com/example/client/mixin', 'net/efn/client/easyplace/mixin']
+        int stripped = 0
+        mixinDirs.each { dir ->
+            def root = destinationDirectory.get().dir(dir).asFile
+            if (!root.exists()) return
+            root.eachFileRecurse(groovy.io.FileType.FILES) { f ->
+                if (!f.name.endsWith('.class')) return
+                def cn = new org.objectweb.asm.tree.ClassNode()
+                new org.objectweb.asm.ClassReader(f.bytes).accept(cn, 0)
+                def doomed = cn.methods.findAll { m ->
+                    (m.access & org.objectweb.asm.Opcodes.ACC_BRIDGE) != 0 &&
+                    m.instructions.any { insn ->
+                        insn instanceof org.objectweb.asm.tree.MethodInsnNode &&
+                        insn.opcode == org.objectweb.asm.Opcodes.INVOKESPECIAL &&
+                        insn.owner != cn.name && insn.name != '<init>'
+                    }
+                }
+                if (doomed) {
+                    cn.methods.removeAll(doomed)
+                    stripped += doomed.size()
+                    def cw = new org.objectweb.asm.ClassWriter(0)
+                    cn.accept(cw)
+                    f.bytes = cw.toByteArray()
+                }
+            }
+        }
+        logger.lifecycle("Stripped ${stripped} inherited bridge method(s) from mixin classes")
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Smoke test: launch the *production* (remapped) jar in a real client under Xvfb, create a world,
+// render it, quit. Catches mixin/remapping problems that compiling can't.  ./gradlew prodClientSmokeTest
+// ---------------------------------------------------------------------------------------------
+def gametestJar = tasks.register('gametestJar', Jar) {
+    from sourceSets.gametest.output
+    from({ configurations.smoketestNatives.collect { zipTree(it) } }) { exclude 'META-INF/**' }
+    archiveClassifier = 'gametest-dev'
+}
+def remapGametestJar = tasks.register('remapGametestJar', net.fabricmc.loom.task.RemapJarTask) {
+    inputFile = gametestJar.flatMap { it.archiveFile }
+    archiveClassifier = 'gametest'
+    addNestedDependencies = false
+}
+tasks.register('prodClientSmokeTest', net.fabricmc.loom.task.prod.ClientProductionRunTask) {
+    mods.from(configurations.productionRuntimeMods)
+    mods.from(tasks.named('remapJar'))
+    mods.from(remapGametestJar)
+    jvmArgs.add('-Dfabric.client.gametest')
+    runDir = layout.buildDirectory.dir('smoketest-run')
+    useXVFB = true
+}
+
+// Same as prodClientSmokeTest, but on the current DISPLAY and with the click-GUI preview steps
+// (used to capture screenshots of the GUI; ImGui draws after Minecraft's own screenshot hook).
+tasks.register('prodClientGuiPreview', net.fabricmc.loom.task.prod.ClientProductionRunTask) {
+    mods.from(configurations.productionRuntimeMods)
+    mods.from(tasks.named('remapJar'))
+    mods.from(remapGametestJar)
+    jvmArgs.add('-Dfabric.client.gametest')
+    jvmArgs.add('-Defn.guipreview=true')
+    runDir = layout.buildDirectory.dir('guipreview-run')
+    useXVFB = false
+}
